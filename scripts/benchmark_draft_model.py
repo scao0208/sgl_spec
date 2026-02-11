@@ -3,19 +3,36 @@ Benchmark draft model speculative decoding with vLLM.
 
 Use a smaller model (e.g., 8B) as draft to speculate for a larger model (e.g., 70B).
 
-Usage:
+Usage (standard speculative decoding):
     CUDA_VISIBLE_DEVICES=0,1,2,3
-    python scripts/benchmark_draft_model.py \
+    python benchmark_draft_model.py \
         --target-model /home/dataset_model/model/models--meta-llama--Llama-3.1-70B-Instruct/snapshot
   s/1605565b47bb9346c5515c34102e054115b4f98b \
         --draft-model /home/dataset_model/model/Llama-3.1-8B-Instruct \
-        --num-speculative-tokens 15\
+        --num-speculative-tokens 15 \
         --tensor-parallel-size 4 \
         --draft-tensor-parallel-size 4 \
         --max-tokens 512 \
         --max-num-seqs 2 \
         --dataset /home/dataset_model/dataset/gsm8k \
-        --enforce-eager
+        --enforce-eager >draft.log 2 >&1 &
+
+Usage (with FLy - Training-Free Loosely Speculative Decoding):
+    CUDA_VISIBLE_DEVICES=0,1,2,3
+    python benchmark_draft_model.py \
+        --target-model /home/dataset_model/model/models--meta-llama--Llama-3.1-70B-Instruct/snapshot
+  s/1605565b47bb9346c5515c34102e054115b4f98b \
+        --draft-model /home/dataset_model/model/Llama-3.1-8B-Instruct \
+        --num-speculative-tokens 15 \
+        --tensor-parallel-size 4 \
+        --draft-tensor-parallel-size 4 \
+        --max-tokens 512 \
+        --max-num-seqs 2 \
+        --dataset /home/dataset_model/dataset/gsm8k \
+        --enforce-eager \
+        --fly-enabled \
+        --fly-entropy-threshold 0.3 \
+        --fly-window-size 6 >fly.log 2 >&1 &
 """
 
 import argparse
@@ -138,6 +155,24 @@ def parse_args():
         default=256,
         help="Maximum number of sequences per iteration (batch size)",
     )
+    # FLy (Training-Free Loosely Speculative Decoding) arguments
+    parser.add_argument(
+        "--fly-enabled",
+        action="store_true",
+        help="Enable FLy loosely speculative decoding (arXiv:2511.22972)",
+    )
+    parser.add_argument(
+        "--fly-entropy-threshold",
+        type=float,
+        default=0.1,
+        help="FLy normalized entropy threshold theta (default: 0.1)",
+    )
+    parser.add_argument(
+        "--fly-window-size",
+        type=int,
+        default=6,
+        help="FLy deferred window size W (default: 6)",
+    )
     return parser.parse_args()
 
 
@@ -221,6 +256,11 @@ def main():
         "num_speculative_tokens": args.num_speculative_tokens,
         "draft_tensor_parallel_size": args.draft_tensor_parallel_size,
     }
+    if args.fly_enabled:
+        spec_config["fly_enabled"] = True
+        spec_config["fly_entropy_threshold"] = args.fly_entropy_threshold
+        spec_config["fly_window_size"] = args.fly_window_size
+        print(f"FLy enabled: theta={args.fly_entropy_threshold}, W={args.fly_window_size}")
     if args.use_tree:
         spec_config["speculative_token_tree"] = str(mc_sim_8b_512)
         print(f"Using tree structure with {len(mc_sim_8b_512)} nodes")
@@ -303,6 +343,11 @@ def main():
     print(f"  Time per iteration: {time_per_iteration_ms:.4f} ms")
     print(f"  Tokens per iteration (avg acceptance): {tokens_per_iteration:.2f}")
     print(f"  Time per token: {time_per_token_ms:.4f} ms")
+    if args.fly_enabled:
+        print("-" * 70)
+        print("FLy METRICS:")
+        print(f"  Entropy threshold (theta): {args.fly_entropy_threshold}")
+        print(f"  Window size (W): {args.fly_window_size}")
     print("=" * 70)
 
     # Output key metrics in JSON format for easy comparison
@@ -319,7 +364,11 @@ def main():
         "draft_efficiency": metrics['draft_efficiency'],
         "time_per_iteration_ms": time_per_iteration_ms,
         "tokens_per_iteration": tokens_per_iteration,
+        "fly_enabled": args.fly_enabled,
     }
+    if args.fly_enabled:
+        json_metrics["fly_entropy_threshold"] = args.fly_entropy_threshold
+        json_metrics["fly_window_size"] = args.fly_window_size
     print(f"\nJSON metrics: {json.dumps(json_metrics)}")
 
     # Print sample outputs

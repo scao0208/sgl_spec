@@ -12,7 +12,8 @@ Usage:
         --max-tokens 512 \
         --max-num-seqs 2 \
         --dataset /home/dataset_model/dataset/gsm8k \
-        --enforce-eager
+        --enforce-eager 
+    >base.log 2 >&1 &
 """
 
 import argparse
