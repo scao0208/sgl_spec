@@ -34,6 +34,11 @@ from vllm.v1.metrics.reader import Counter, Vector
 from choices import mc_sim_8b_512
 from datasets import detect_and_load
 
+# Patch vLLM's MAX_SPEC_LEN to support 512+ token trees.
+# Default is 128 which is too small for our large tree benchmarks.
+import vllm.v1.sample.rejection_sampler as _rs
+_rs.MAX_SPEC_LEN = 1024
+
 SAMPLE_PROMPTS = [
     "Write a Python function to implement binary search.",
     "Explain the concept of quantum entanglement in simple terms.",
@@ -273,7 +278,8 @@ def parse_args():
     parser.add_argument("--target-model", type=str, required=True)
     parser.add_argument("--draft-model", type=str, required=True)
     parser.add_argument("--tensor-parallel-size", type=int, default=None)
-    parser.add_argument("--draft-tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--draft-tensor-parallel-size", type=int, default=None,
+                        help="Draft model TP size (defaults to --tensor-parallel-size)")
     parser.add_argument("--num-prompts", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -302,6 +308,7 @@ def main():
     print(f"Running with {len(prompts)} prompts")
 
     tp_size = args.tensor_parallel_size or torch.cuda.device_count()
+    draft_tp_size = args.draft_tensor_parallel_size or tp_size
     tree = mc_sim_8b_512
     tree_len = len(tree)
     max_depth = max(len(node) for node in tree)
@@ -311,13 +318,14 @@ def main():
     print(f"Draft model: {args.draft_model}")
     print(f"Tree: {tree_len} nodes, depth {max_depth}")
     print(f"Kernel: {'ea_attn_exp' if args.use_eagle_kernel else 'vllm_unified'}")
+    print(f"TP: target={tp_size}, draft={draft_tp_size}")
 
     spec_config = {
         "method": "draft_model",
         "model": args.draft_model,
         "num_speculative_tokens": tree_len,
         "speculative_token_tree": str(tree),
-        "draft_tensor_parallel_size": args.draft_tensor_parallel_size,
+        "draft_tensor_parallel_size": draft_tp_size,
     }
 
     llm = LLM(
