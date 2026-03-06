@@ -11,7 +11,7 @@ This is a benchmarking toolkit for evaluating **SGLang speculative decoding** pe
 ## Setup
 
 ```bash
-conda activate vllm-spec
+conda activate sgl-spec
 ```
 
 Key dependency: `sglang` (from `thirdparty/sglang` submodule). For STANDALONE mode with a patched sglang:
