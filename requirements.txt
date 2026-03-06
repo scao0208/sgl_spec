@@ -1,3 +1,4 @@
+sglang==0.5.8.post1  # built from source (thirdparty/sglang)
 vllm==0.15.0
 compressed-tensors==0.13.0
 pandas==3.0.0
