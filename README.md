@@ -1,56 +1,77 @@
-# Speculative decoding by vllm 0.15.0
+# Speculative Decoding with SGLang
 
-This repositary provides guidance to deploy classic speculative decoding experiments following the paper "Accelerating Large Language Model Decoding
-with Speculative Sampling"(https://arxiv.org/pdf/2302.01318) and "Training-Free Loosely Speculative Decoding: Accepting Semantically Correct Drafts Beyond Exact Match"(https://arxiv.org/abs/2511.22972).
+This repository provides benchmarking tools for speculative decoding experiments with [SGLang](https://github.com/sgl-project/sglang), following the papers "Accelerating Large Language Model Decoding with Speculative Sampling" (https://arxiv.org/pdf/2302.01318) and "Training-Free Loosely Speculative Decoding: Accepting Semantically Correct Drafts Beyond Exact Match" (https://arxiv.org/abs/2511.22972).
 
 ## Project Overview
 
-This is a benchmarking toolkit for evaluating **vLLM speculative decoding** performance. It measures speedup achieved when using a smaller "draft" model to speculate tokens for a larger "target" model.
+This is a benchmarking toolkit for evaluating **SGLang speculative decoding** performance. It supports two speculative algorithms:
+- **EAGLE3**: Dynamic tree drafting with EAGLE3-specific draft models and confidence-based reranking
+- **STANDALONE**: Draft-model speculation using any compatible smaller model (chain or tree), with optional FLy verification
+
+## Setup
+
+```bash
+conda activate vllm-spec
+```
+
+Key dependency: `sglang` (from `thirdparty/sglang` submodule). For STANDALONE mode with a patched sglang:
+```bash
+export PYTHONPATH="/path/to/thirdparty/sglang/python:${PYTHONPATH:-}"
+```
 
 ## Running Benchmarks
 
+All scripts must run from `scripts/` due to relative imports.
+
 **Baseline (no speculative decoding):**
 ```bash
-python scripts/benchmark_baseline.py \
+cd scripts
+CUDA_VISIBLE_DEVICES=0,1,2,3 python benchmark_baseline.py \
+    --model /path/to/Llama-3.1-70B-Instruct \
+    --tp-size 4 --max-tokens 512 --num-prompts 164 \
+    --dataset /path/to/humaneval
+```
+
+**EAGLE3 speculative decoding:**
+```bash
+cd scripts
+CUDA_VISIBLE_DEVICES=0,1,2,3 python benchmark_sglang_eagle3.py \
     --target-model meta-llama/Llama-3.3-70B-Instruct \
-    --tensor-parallel-size 4 \
-    --num-prompts 20 \
-    --max-tokens 256 \
-    --max-num-seqs 2 \
-    --gsm8k /path/to/gsm8k
+    --draft-model /path/to/EAGLE3-LLaMA3.1-Instruct-70B \
+    --tp-size 4 --num-steps 5 --eagle-topk 8 --num-draft-tokens 64 \
+    --dataset /path/to/gsm8k --num-prompts 50
 ```
 
-**Speculative decoding with draft model:**
+**STANDALONE chain drafting with FLy:**
 ```bash
-python scripts/benchmark_draft_model.py \
+cd scripts
+CUDA_VISIBLE_DEVICES=0,1,2,3 python benchmark_sglang_eagle3.py \
     --target-model /path/to/70B-model \
-    --draft-model meta-llama/Llama-3.1-8B-Instruct \
-    --num-speculative-tokens 24 \
-    --tensor-parallel-size 4 \
-    --draft-tensor-parallel-size 4 \
-    --use-tree \
-    --max-num-seqs 2 \
-    --gsm8k /path/to/gsm8k
+    --draft-model /path/to/8B-model \
+    --speculative-algorithm STANDALONE \
+    --tp-size 4 --num-steps 22 --num-draft-tokens 23 \
+    --fly-enabled --fly-entropy-threshold 0.3 --fly-window-size 6 \
+    --dataset /path/to/humaneval --num-prompts 164
 ```
 
-**Training-Free Loosely Speculative Decoding:**
+**STANDALONE tree drafting with FLy:**
 ```bash
-python scripts/benchmark_draft_model.py \
+cd scripts
+CUDA_VISIBLE_DEVICES=0,1,2,3 python benchmark_sglang_eagle3.py \
     --target-model /path/to/70B-model \
-    --draft-model meta-llama/Llama-3.1-8B-Instruct \
-    --num-speculative-tokens 15 \
-    --tensor-parallel-size 4 \
-    --draft-tensor-parallel-size 4 \
-    --max-num-seqs 2 \
-    --max-tokens 512 \
-    --gsm8k /path/to/gsm8k \
-    --fly-enabled
+    --draft-model /path/to/8B-model \
+    --speculative-algorithm STANDALONE \
+    --tp-size 4 --eagle-topk 5 --num-steps 22 --num-draft-tokens 512 \
+    --fly-enabled --dataset /path/to/humaneval
 ```
 
-**Key flags:**
-- `--enforce-eager`: Disable CUDA graphs (helps with stability)
-- `--use-tree`: Enable tree-based speculation with 512-node structure
-- `--gsm8k`: Path to GSM8K dataset (expects parquet at `{path}/main/test-00000-of-00001.parquet`)
+**Key parameters:**
+- `--num-steps`: Draft depth (default: 5)
+- `--eagle-topk`: Branching factor per step (EAGLE3 default: 8, STANDALONE default: 1)
+- `--num-draft-tokens`: Max parallel verification tokens (EAGLE3 default: 63, STANDALONE default: num_steps+1)
+- `--profile-attention`: Instrument RadixAttention for CUDA event timing
+
+Pre-built shell scripts are available in `scripts/` for specific experiment configurations (e.g., `run_baseline_he.sh`, `run_fly_chain_he.sh`).
 
 ## FLy Algorithm (Training-Free Loosely Speculative Decoding)
 
@@ -60,28 +81,19 @@ This project also explores the FLy algorithm ([arXiv:2511.22972](https://arxiv.o
 
 **Core idea:** LLMs exhibit self-corrective behavior when conditioned on genuinely wrong tokens, but continue smoothly when conditioned on semantically valid alternatives. FLy exploits this property through a two-tier verification mechanism:
 
-1. **Entropy-Level Gate:** At each mismatch position, compute the normalized entropy of the target model's distribution from its already-available logits. If entropy is low (h < θ, default θ=0.3), the target is confident and the mismatch is likely a real error (e.g., wrong digit in arithmetic) — reject immediately via standard SPD. If entropy is high, multiple tokens are plausible — proceed to tier 2.
+1. **Entropy-Level Gate:** At each mismatch position, compute the normalized entropy of the target model's distribution from its already-available logits. If entropy is low (h < θ, default θ=0.3), the target is confident and the mismatch is likely a real error — reject immediately. If entropy is high, multiple tokens are plausible — proceed to tier 2.
 
-2. **Token-Level Deferred Window:** For high-entropy mismatches, monitor the next W tokens (default W=6). If no further mismatches appear in that window, the target model is continuing smoothly from the draft token, indicating semantic validity — accept the mismatch. If another mismatch appears, the target is course-correcting — reject.
-
-**Multi-Level Acceleration (MLA):** Since FLy dramatically increases mean accepted tokens (τ ≈ 12 vs ≈ 4 in standard SPD), the drafter must propose more tokens per round (K=15-25), making draft cost the bottleneck. MLA accelerates the drafter itself using prompt lookup decoding (n-gram retrieval), reducing draft latency by ~20%.
+2. **Token-Level Deferred Window:** For high-entropy mismatches, monitor the next W tokens (default W=6). If no further mismatches appear in that window, the target model is continuing smoothly — accept the mismatch. If another mismatch appears, the target is course-correcting — reject.
 
 ## Architecture
 
-Two benchmark scripts with a shared structure:
-1. `benchmark_baseline.py` - Pure target model inference, establishes baseline throughput
-2. `benchmark_draft_model.py` - Speculative decoding with draft model, extracts acceptance metrics
+Two benchmark scripts:
+1. `benchmark_baseline.py` — Pure target model inference via SGLang, establishes baseline throughput
+2. `benchmark_sglang_eagle3.py` — Speculative decoding (EAGLE3 or STANDALONE) with optional FLy verification and attention profiling
 
-**Key metrics extracted:**
-- Throughput (tokens/s)
-- Time per token (ms) - primary comparison metric
-- Acceptance rate by position (speculative only)
-- Draft efficiency = accepted_tokens / proposed_tokens (speculative only)
-
-**Tree structures:** The draft benchmark includes hardcoded Monte Carlo simulation trees (`mc_sim_8b_12`, `mc_sim_8b_512`) for tree-based speculative decoding. The 512-node tree spans 24 levels.
-
-**Metrics extraction:** Uses vLLM's internal counters:
-- `vllm:spec_decode_num_drafts`
-- `vllm:spec_decode_num_draft_tokens`
-- `vllm:spec_decode_num_accepted_tokens`
-- `vllm:spec_decode_num_accepted_tokens_per_pos`
+**Key metrics extracted from SGLang's per-request `meta_info`:**
+- Throughput (tokens/s) and time per token (ms)
+- `spec_verify_ct`: number of verification rounds
+- `spec_accepted_tokens`: total accepted draft tokens
+- Avg acceptance length = total_tokens / verify_rounds
+- FLy metrics: deferral counts, acceptance rate, entropy gate rejections
